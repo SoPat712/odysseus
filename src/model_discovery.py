@@ -88,12 +88,20 @@ def discover_tailscale_hosts() -> List[str]:
 
 
 class ModelDiscovery:
+    # Cache TTL for discover_models() results. A full port scan (24 ports ×
+    # N hosts × 3 s timeout, 50-thread pool) takes several seconds of CPU and
+    # should not repeat on every keepalive tick.
+    _DISCOVERY_CACHE_TTL = 300  # 5 minutes between full re-scans
+
     def __init__(self, default_host: str, openai_api_key: Optional[str] = None):
         self.default_host = default_host
         self.openai_api_key = openai_api_key
         self.openai_compat_path = "/v1/chat/completions"
         # Custom ports from env vars, merged into the scan list by discover_models.
         self._extra_ports: set = set()
+        # Cache for the last full discovery result.
+        self._discovery_cache: Optional[Dict[str, Any]] = None
+        self._discovery_cache_time: float = 0
 
     def _get_hosts(self) -> List[str]:
         """Get all hosts to scan, using env override, Tailscale, or default."""
@@ -218,10 +226,15 @@ class ModelDiscovery:
         # Sort by host then port for consistent ordering
         items.sort(key=lambda x: (x["host"], x["port"]))
 
+        result = {"hosts": hosts, "items": items}
+        # Cache result so repeated callers (warmup, keepalive) skip the port scan.
+        self._discovery_cache = result
+        self._discovery_cache_time = time.time()
+
         logger.info(
             f"Discovered {len(items)} model endpoints across {len(hosts)} hosts"
         )
-        return {"hosts": hosts, "items": items}
+        return result
 
     def warmup_ping_urls(self, limit: int = 5) -> List[str]:
         """The ``/models`` URLs of up to ``limit`` discovered endpoints.
@@ -230,11 +243,38 @@ class ModelDiscovery:
         discovered item already carries a ``/v1/chat/completions`` url; swap the
         suffix for the cheap ``/models`` probe. Failures degrade to an empty list
         so warmup never crashes the caller.
+
+        Uses the cached discovery result when it's still fresh (< _DISCOVERY_CACHE_TTL
+        seconds old) so repeated calls don't re-run the full 50-thread port scan.
         """
         try:
-            items = (self.discover_models() or {}).get("items", [])
+            now = time.time()
+            if (
+                self._discovery_cache is not None
+                and (now - self._discovery_cache_time) < self._DISCOVERY_CACHE_TTL
+            ):
+                items = (self._discovery_cache or {}).get("items", [])
+            else:
+                items = (self.discover_models() or {}).get("items", [])
         except Exception:
             return []
+        urls: List[str] = []
+        for ep in items[:limit]:
+            url = (ep.get("url") or "").replace("/chat/completions", "/models")
+            if url:
+                urls.append(url)
+        return urls
+
+    def cached_ping_urls(self, limit: int = 5) -> List[str]:
+        """Like warmup_ping_urls but NEVER triggers a port scan.
+
+        Returns URLs from the last cached discovery result, or an empty list if no
+        discovery has run yet. Safe to call from tight loops (keepalive, etc.) because
+        it does zero I/O.
+        """
+        if self._discovery_cache is None:
+            return []
+        items = (self._discovery_cache or {}).get("items", [])
         urls: List[str] = []
         for ep in items[:limit]:
             url = (ep.get("url") or "").replace("/chat/completions", "/models")

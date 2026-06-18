@@ -1001,12 +1001,26 @@ async def _startup_event():
 
     _startup_tasks.append(asyncio.create_task(_warmup_endpoints()))
 
-    # Keep-alive: ping endpoints every 60 seconds to prevent cold starts
+    # Keep-alive: ping endpoints every 60 seconds to prevent cold starts.
+    # Uses cached_ping_urls() (zero I/O) instead of a full port scan so this
+    # loop doesn't spin up 50 threads every minute when no LLM is configured.
     async def _keepalive_loop():
         while True:
             try:
                 await asyncio.sleep(60)
-                await _warmup_endpoints()
+                if not model_discovery:
+                    continue
+                urls = model_discovery.cached_ping_urls()
+                if not urls:
+                    continue  # No known endpoints yet; skip until discovery runs
+                import httpx as _httpx
+                for url in urls:
+                    try:
+                        async with _httpx.AsyncClient(timeout=5.0) as client:
+                            await client.get(url)
+                        logger.debug(f"Keepalive ping OK: {url}")
+                    except Exception as e:
+                        logger.debug(f"Keepalive ping failed: {e}")
             except Exception as e:
                 logger.warning(f"Keepalive loop error: {e}")
                 await asyncio.sleep(300)  # Back off on error
