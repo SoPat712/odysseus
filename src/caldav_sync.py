@@ -162,7 +162,7 @@ def _to_utc_naive(dt):
     return datetime(dt.year, dt.month, dt.day), True
 
 
-def _find_existing_event(db, pending, uid_val, calendar_id):
+def _find_existing_event(db, pending, uid_val, calendar_id, owner=None):
     """Find the event to update for THIS calendar.
 
     CalendarEvent.uid is the global primary key, so an unscoped lookup by uid
@@ -173,12 +173,35 @@ def _find_existing_event(db, pending, uid_val, calendar_id):
     Scope the lookup to the calendar being synced; a genuine cross-user uid
     collision then fails the PK insert inside the per-calendar try/except
     instead of hijacking the row. (import_ics was already fixed this way.)
+
+    Additional fallback: if the uid is not found under the expected calendar_id
+    but IS found under a *different* calendar belonging to the same owner (e.g.
+    after the stable calendar-id hash changed due to multi-account migration),
+    we return that row so the caller can reassign calendar_id rather than
+    attempting a duplicate INSERT that will hit the UNIQUE constraint. This
+    intentionally does NOT return events belonging to a different owner.
     """
-    from core.database import CalendarEvent
-    return pending.get(uid_val) or db.query(CalendarEvent).filter(
+    from core.database import CalendarCal, CalendarEvent
+    hit = pending.get(uid_val) or db.query(CalendarEvent).filter(
         CalendarEvent.uid == uid_val,
         CalendarEvent.calendar_id == calendar_id,
     ).first()
+    if hit:
+        return hit
+    # Fallback: same-owner event under a different CalDAV calendar_id (e.g.
+    # the stable hash changed after multi-account migration).
+    if owner:
+        hit = (
+            db.query(CalendarEvent)
+            .join(CalendarCal, CalendarEvent.calendar_id == CalendarCal.id)
+            .filter(
+                CalendarEvent.uid == uid_val,
+                CalendarCal.owner == owner,
+                CalendarCal.source == "caldav",
+            )
+            .first()
+        )
+    return hit
 
 
 def _google_caldav_events_url(url: str) -> str | None:
@@ -408,7 +431,7 @@ def _sync_blocking(owner: str, url: str, username: str, password: str, account_i
                             else ""
                         )
 
-                        existing = _find_existing_event(db, pending, uid_val, local_cal.id)
+                        existing = _find_existing_event(db, pending, uid_val, local_cal.id, owner=owner)
                         if existing:
                             if existing.caldav_sync_pending in {"create", "update"}:
                                 result["events"] += 1
@@ -445,7 +468,51 @@ def _sync_blocking(owner: str, url: str, username: str, password: str, account_i
                             db.add(new_ev)
                             pending[uid_val] = new_ev
                         result["events"] += 1
-                db.commit()
+                # Commit the batch. On a UNIQUE violation (e.g. a UID exists
+                # under a different calendar_id that our lookup missed), fall
+                # back to per-row upsert so one duplicate doesn't discard the
+                # whole calendar batch.
+                try:
+                    db.commit()
+                except Exception as commit_err:
+                    import sqlalchemy.exc as _sa_exc
+                    if not isinstance(commit_err, _sa_exc.IntegrityError):
+                        raise
+                    db.rollback()
+                    logger.warning(
+                        "CalDAV bulk commit failed (%s); retrying row-by-row",
+                        commit_err,
+                    )
+                    # Re-fetch and apply updates row by row to salvage the batch.
+                    for ev_uid, ev_obj in list(pending.items()):
+                        try:
+                            dupe = db.query(CalendarEvent).filter(
+                                CalendarEvent.uid == ev_uid
+                            ).first()
+                            if dupe:
+                                # Reassign to the correct calendar and update fields.
+                                dupe.calendar_id = ev_obj.calendar_id
+                                dupe.summary = ev_obj.summary
+                                dupe.description = ev_obj.description
+                                dupe.location = ev_obj.location
+                                dupe.dtstart = ev_obj.dtstart
+                                dupe.dtend = ev_obj.dtend
+                                dupe.all_day = ev_obj.all_day
+                                dupe.is_utc = ev_obj.is_utc
+                                dupe.rrule = ev_obj.rrule
+                                dupe.origin = ev_obj.origin
+                                dupe.remote_href = ev_obj.remote_href
+                                dupe.remote_etag = ev_obj.remote_etag
+                                dupe.caldav_sync_pending = None
+                                db.expunge(ev_obj)  # drop the conflicting in-session object
+                            db.commit()
+                        except Exception as row_err:
+                            db.rollback()
+                            logger.warning(
+                                "CalDAV row-by-row upsert failed for uid=%s: %s",
+                                ev_uid, row_err,
+                            )
+                            result["errors"].append(f"{display_name}: uid={ev_uid} upsert failed: {str(row_err)[:120]}")
 
                 # Prune locally-cached CalDAV events that vanished
                 # upstream (only within our sync window — events outside
