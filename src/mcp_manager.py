@@ -323,7 +323,17 @@ class McpManager:
         return False
 
     async def _connect_http(self, server_id: str, name: str, url: str) -> bool:
-        """Connect to a Streamable HTTP MCP server (with automatic OAuth)."""
+        """Connect to a Streamable HTTP MCP server (with automatic OAuth).
+
+        NOTE: The mcp library's streamable_http transport uses anyio task groups
+        internally. When a connection fails (e.g. ConnectError), anyio's cancel
+        scope cleanup raises RuntimeError('Attempted to exit cancel scope in a
+        different task than it was entered in'). That RuntimeError is NOT a
+        subclass of Exception, so a bare `except Exception` lets it escape and
+        permanently corrupts the asyncio event loop's _deliver_cancellation
+        registry, causing a 100% CPU spin-loop.  We catch BaseException here to
+        ensure the broken cancel scope is fully contained within this coroutine.
+        """
         try:
             from mcp import ClientSession
             from mcp.client.streamable_http import streamablehttp_client
@@ -340,12 +350,23 @@ class McpManager:
 
             provider = build_provider(server_id, url, on_redirect=_on_redirect)
             stack = AsyncExitStack()
-            transport = await stack.enter_async_context(streamablehttp_client(url, auth=provider))
-            read_stream, write_stream, _get_session_id = transport
-            session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
-            await session.initialize()
+            try:
+                transport = await stack.enter_async_context(streamablehttp_client(url, auth=provider))
+                read_stream, write_stream, _get_session_id = transport
+                session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
+                await session.initialize()
 
-            tools_result = await session.list_tools()
+                tools_result = await session.list_tools()
+            except BaseException:
+                # BaseException (not just Exception) is required here: the mcp
+                # library's anyio cleanup can raise RuntimeError on connection
+                # failure, which is not an Exception subclass.  Swallow it after
+                # attempting stack cleanup so the event loop stays healthy.
+                try:
+                    await stack.aclose()
+                except BaseException:
+                    pass
+                raise
             tools = []
             for tool in tools_result.tools:
                 tools.append({
@@ -372,10 +393,13 @@ class McpManager:
             logger.warning("MCP package not installed. Install with: pip install mcp")
             self._connections[server_id] = {"status": "error", "error": "mcp package not installed", "name": name}
             return False
-        except Exception as e:
-            logger.error(f"Failed to connect HTTP MCP server {name} ({server_id}): {e}")
+        except BaseException as e:
+            # Catch BaseException (covers RuntimeError from anyio cancel scope
+            # teardown as well as ordinary connection errors).
+            logger.error(f"Failed to connect HTTP MCP server {name} ({server_id}): {type(e).__name__}: {e}")
             self._connections[server_id] = {"status": "error", "error": str(e), "name": name}
             return False
+
 
     async def disconnect_server(self, server_id: str):
         """Disconnect from an MCP server."""
